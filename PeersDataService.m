@@ -25,7 +25,23 @@
 }
 
 //业务逻辑
-- (NSMutableArray*)fetchFileArr
+- (NSMutableArray*)fetchClientFileArr
+{
+    NSMutableArray* fileArr = [[NSMutableArray alloc] init];
+    NSFileManager* fmgr = [NSFileManager defaultManager];
+    NSString *fileDir = [NSHomeDirectory() stringByAppendingPathComponent:SyncFileDir_C];
+    if (![fmgr fileExistsAtPath:fileDir]) {
+        [fmgr createDirectoryAtPath:fileDir withIntermediateDirectories:YES attributes:nil error:nil];
+        return fileArr;
+    }
+    NSDirectoryEnumerator *femun = [fmgr enumeratorAtURL:[NSURL fileURLWithPath:fileDir] includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles errorHandler:nil];
+    for (NSURL *fileUrl in femun) {
+        [fileArr addObject:[fileUrl lastPathComponent]];
+    }
+    return fileArr;//name arr
+}
+
+- (NSMutableArray*)fetchServiceFileArrWith:(NSMutableArray*)clientArr;
 {
     NSMutableArray* fileArr = [[NSMutableArray alloc] init];
     NSFileManager* fmgr = [NSFileManager defaultManager];
@@ -36,12 +52,14 @@
     }
     NSDirectoryEnumerator *femun = [fmgr enumeratorAtURL:[NSURL fileURLWithPath:fileDir] includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles errorHandler:nil];
     for (NSURL *fileUrl in femun) {
-        [fileArr addObject:fileUrl];
+        if (![clientArr containsObject:[fileUrl lastPathComponent]]) {
+            [fileArr addObject:fileUrl];
+        }
     }
     return fileArr;
 }
 
-//处理airdrop文件或者文件夹保存逻辑
+//客户端处理文件
 - (void)handleClientData:(NSURL*)url andName:(NSString*)name
 {
     NSFileManager* fmgr = [NSFileManager defaultManager];
@@ -55,34 +73,49 @@
         [fmgr removeItemAtPath:filePath error:nil];
     }
     [recvData writeToFile:filePath atomically:YES];
+    NSLog(@"成功接收: %@", name);
 }
 //业务逻辑结束
-static int snum = 0;
-static int scount = 0;
-- (void)sendFileArr:(MCPeerID*)peer
+
+//客户端发送同步消息
+- (void)sendSyncMsg:(MCPeerID*)peer andMsgArr:(NSMutableArray*)msgArr
 {
-    NSMutableArray* fileArr = [self fetchFileArr];
-    snum = fileArr.count;
-    scount = 0;
-    for (NSURL* fileUrl in fileArr) {
-        [self sendResource:peer andFile:fileUrl];
+    NSString* msgStr = @"empty";
+    if (msgArr&&msgArr.count) {
+        msgStr = [msgArr componentsJoinedByString:@"||"];
     }
+    NSError* error;
+    [client_session sendData:[msgStr dataUsingEncoding:NSUTF8StringEncoding] toPeers:@[peer] withMode:MCSessionSendDataReliable error:&error];
+    NSLog(@"%@", @"发送同步消息...");
 }
 
-//服务器发送资源
-- (void)sendResource:(MCPeerID*)peer andFile:(NSURL*)fileURL
+//服务端发送资源
+- (void)sendFileArr:(MCPeerID*)peer andArr:(NSMutableArray*)clientArr
 {
-    [server_session sendResourceAtURL:fileURL withName:[fileURL lastPathComponent] toPeer:peer withCompletionHandler:^(NSError * _Nullable error) {
-        scount++;
-        if (!error) {
-            NSLog(@"发送成功：%@", [fileURL lastPathComponent]);
-        }else{
-            NSLog(@"发送失败：%@--%@", [fileURL lastPathComponent], error);
-        }
-        if (scount == snum) {
-            NSLog(@"%@", @"全部传输完毕!!!");
-        }
-    }];
+    NSMutableArray* fileArr = [self fetchServiceFileArrWith:clientArr];
+    __block int snum = (int)fileArr.count;
+    __block int scount = 0;
+    __block MCSession* service_session = server_session;
+    if (snum == 0) {
+        NSLog(@"%@: 数据全部传输完毕!!!", peer.displayName);
+        NSError* error;
+        [service_session sendData:[@"filesync_end" dataUsingEncoding:NSUTF8StringEncoding] toPeers:@[peer] withMode:MCSessionSendDataReliable error:&error];
+    }
+    for (NSURL* fileUrl in fileArr) {
+        [server_session sendResourceAtURL:fileUrl withName:[fileUrl lastPathComponent] toPeer:peer withCompletionHandler:^(NSError * _Nullable error) {
+            scount++;
+            if (!error) {
+                NSLog(@"发送成功：%@", [fileUrl lastPathComponent]);
+            }else{
+                NSLog(@"发送失败：%@--%@", [fileUrl lastPathComponent], error);
+            }
+            if (scount == snum) {
+                NSLog(@"%@: 数据全部传输完毕!!!", peer.displayName);
+                NSError* error;
+                [service_session sendData:[@"filesync_end" dataUsingEncoding:NSUTF8StringEncoding] toPeers:@[peer] withMode:MCSessionSendDataReliable error:&error];
+            }
+        }];
+    }
 }
 
 //p2p机制
@@ -104,14 +137,13 @@ static PeersDataService* instance;
 - (instancetype)init
 {
     if (self = [super init]) {
-        //服务器端
+        //服务端
         localPeerID_s = [[MCPeerID alloc] initWithDisplayName:NSUserName()];
         advertiser = [[MCNearbyServiceAdvertiser alloc] initWithPeer:localPeerID_s discoveryInfo:nil serviceType:XXServiceType];
         advertiser.delegate = self;
         cur_service_id = [NSString stringWithFormat:@"%@", localPeerID_s.displayName];
-        NSLog(@"service_id>>>\n%@", cur_service_id);
         //客户端
-        localPeerID_c = [[MCPeerID alloc] initWithDisplayName:NSUserName()];
+        localPeerID_c = [[MCPeerID alloc] initWithDisplayName:[NSUserName() stringByAppendingString:@"_client"]];
         browser = [[MCNearbyServiceBrowser alloc] initWithPeer:localPeerID_c serviceType:XXServiceType];
         browser.delegate = self;
         //
@@ -124,6 +156,7 @@ static PeersDataService* instance;
 {
     [advertiser startAdvertisingPeer];
     NSLog(@"%@", @"开启服务器!!!");
+    NSLog(@"服务号: %@", cur_service_id);
     return cur_service_id;
 }
 
@@ -133,7 +166,7 @@ static PeersDataService* instance;
     NSLog(@"%@", @"关闭服务器!!!");
 }
 
-//服务器代理
+//服务端回调代理
 - (void)            advertiser:(MCNearbyServiceAdvertiser *)advertiser
   didReceiveInvitationFromPeer:(MCPeerID *)peerID
                    withContext:(NSData *)context
@@ -143,6 +176,7 @@ static PeersDataService* instance;
     NSString* client_id = [[NSString alloc] initWithData:context encoding:NSUTF8StringEncoding];
     if ([client_id isEqualToString:cur_service_id]) {
         NSLog(@"%@", @"接收到客户端连接!!!!");
+        NSLog(@"客户端：%@", peerID.displayName);
         server_session = [[MCSession alloc] initWithPeer:localPeerID_s];
         server_session.delegate = self;
         invitationHandler(YES, server_session);
@@ -170,19 +204,19 @@ static PeersDataService* instance;
 {
     [browser stopBrowsingForPeers];
     NSLog(@"%@", @"关闭客户端搜索!!!");
+    exit(0);
 }
 //客户端代理
-// Found a nearby advertising peer.
 - (void)        browser:(MCNearbyServiceBrowser *)brwser
               foundPeer:(MCPeerID *)peerID
       withDiscoveryInfo:(nullable NSDictionary<NSString *, NSString *> *)info
 {
-    //找到了服务器端，可能会找到多个
+    //找到了服务端，可能会找到多个
     if ([cur_client_id isEqualToString:peerID.displayName]) {
         client_session = [[MCSession alloc] initWithPeer:localPeerID_c];
         client_session.delegate = self;
         [browser invitePeer:peerID toSession:client_session withContext:[cur_client_id dataUsingEncoding:NSUTF8StringEncoding] timeout:0];
-        NSLog(@"%@", @"开始连接服务器!!!!");
+        NSLog(@"开始连接服务端: %@", peerID.displayName);
         //[self stopBrowser];
     }
 }
@@ -209,8 +243,8 @@ static PeersDataService* instance;
     switch(state){
         case MCSessionStateConnected:{
             NSLog(@"连接成功.");
-            if ([session isEqual:server_session]) {
-                [self sendFileArr:peerID];//开始传送数据给客户端
+            if ([session isEqual:client_session]) {
+                [self sendSyncMsg:peerID andMsgArr:[self fetchClientFileArr]];
             }
             break;
         }
@@ -227,7 +261,20 @@ static PeersDataService* instance;
 {
     NSString* info = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (info) {
-        NSLog(@">> %@", info);
+        //NSLog(@">> %@", info);
+        if ([session isEqual:server_session]) {
+            if ([info isEqualToString:@"empty"]) {
+                [self sendFileArr:peerID andArr:[NSMutableArray new]];
+            }else{
+                NSArray* clientArr = [info componentsSeparatedByString:@"||"];
+                [self sendFileArr:peerID andArr:[[NSMutableArray alloc] initWithArray:clientArr]];
+            }
+        }
+        if ([session isEqual:client_session]) {
+            if ([info isEqualToString:@"filesync_end"]) {
+                [self stopBrowser];
+            }
+        }
     }
 }
 
@@ -254,8 +301,9 @@ static PeersDataService* instance;
                           withError:(NSError *)error
 {
     if (!error) {
-        [self handleClientData:localURL andName:resourceName];
-        NSLog(@"recv>>>\n%@", resourceName);
+        if ([session isEqual:client_session]) {
+            [self handleClientData:localURL andName:resourceName];
+        }
     }else{
         NSLog(@"%@", error);
     }
